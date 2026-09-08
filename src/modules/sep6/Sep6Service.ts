@@ -77,21 +77,27 @@ export function createSep6Service(db: Db): Sep6Service {
     if (!id) {
       throw upstream(`SEP-6 ${kind} response missing transaction id`, response);
     }
-    await db.insert(sepTransactions).values({
-      remittance_id: input.remittanceId ?? null,
-      anchor_id: input.anchorId,
-      user_id: input.userId ?? null,
-      kind,
-      protocol: 'sep6',
-      anchor_tx_id: id,
-      anchor_tx_status: typeof response.status === 'string' ? response.status : 'pending',
-      amount_in: kind === 'deposit' ? input.amount : undefined,
-      amount_out: kind === 'withdraw' ? input.amount : undefined,
-      asset_in: kind === 'deposit' ? input.assetCode : undefined,
-      asset_out: kind === 'withdraw' ? input.assetCode : undefined,
-      status: 'pending',
-    });
-    return { id, protocol: 'sep6', status: 'pending', instructions: response };
+    const inserted = await db
+      .insert(sepTransactions)
+      .values({
+        remittance_id: input.remittanceId ?? null,
+        anchor_id: input.anchorId,
+        user_id: input.userId ?? null,
+        kind,
+        protocol: 'sep6',
+        anchor_tx_id: id,
+        anchor_tx_status: typeof response.status === 'string' ? response.status : 'pending',
+        amount_in: kind === 'deposit' ? input.amount : undefined,
+        amount_out: kind === 'withdraw' ? input.amount : undefined,
+        asset_in: kind === 'deposit' ? input.assetCode : undefined,
+        asset_out: kind === 'withdraw' ? input.assetCode : undefined,
+        status: 'pending',
+      })
+      .returning({ id: sepTransactions.id });
+    // The result id is the *internal* transaction row id (like SEP-24), so
+    // routes can update the row and clients can look it up via
+    // /v1/sep6/transactions/:id. The anchor's own id stays in anchor_tx_id.
+    return { id: inserted[0]!.id, protocol: 'sep6', status: 'pending', instructions: response };
   }
 
   async function withFallback(
