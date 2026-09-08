@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm test
+
+  # Testnet integration smoke (requires secrets; skipped on forks/PRs).
+  testnet-integration:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && vars.RUN_TESTNET_INTEGRATION == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:integration
+        env:
+          CONTRACT_ID: ${{ secrets.TESTNET_CONTRACT_ID }}
+          ADMIN_SECRET: ${{ secrets.TESTNET_ADMIN_SECRET }}
+          ORACLE_SECRET: ${{ secrets.TESTNET_ORACLE_SECRET }}
+          FEE_OPERATOR_SECRET: ${{ secrets.TESTNET_FEE_OPERATOR_SECRET }}
