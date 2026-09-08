@@ -34,6 +34,9 @@ export function createJwtService(): JwtService {
       try {
         return jwt.verify(token, env.JWT_SECRET, {
           issuer: 'remittance-backend',
+          // Pin the algorithm so a downgrade to 'none' or a symmetric-key
+          // confusion attack is structurally impossible.
+          algorithms: ['HS256'],
         }) as SessionClaims;
       } catch {
         throw unauthorized('Invalid or expired session');

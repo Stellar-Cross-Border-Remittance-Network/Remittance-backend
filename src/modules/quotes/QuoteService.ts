@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 
 import { loadEnv } from '../../config/env.js';
 import type { Db } from '../../db/client.js';
@@ -42,13 +42,20 @@ export interface ComputedQuote {
   priceImpactBps: number;
   expiresAt: Date;
   quoteHash: string;
+  /** When the quote was consumed by a remittance (single-use semantics). */
+  usedAt?: Date;
 }
 
 export interface QuoteService {
-  createQuote(input: QuoteInput): Promise<ComputedQuote>;
+  createQuote(input: QuoteInput, ownerId?: string): Promise<ComputedQuote>;
   getQuote(id: string): Promise<ComputedQuote>;
-  /** Integrity + freshness check before a remittance is created from a quote. */
+  /**
+   * Integrity + freshness check before a remittance is created from a quote.
+   * Rejects quotes that were already consumed (single-use) or have expired.
+   */
   assertUsable(quoteId: string, expected: Partial<QuoteInput>): Promise<ComputedQuote>;
+  /** Atomically claim a quote for one remittance; false when already used. */
+  claim(quoteId: string): Promise<boolean>;
 }
 
 /** Pure FX math — no I/O, fully unit-testable. */
@@ -223,13 +230,16 @@ export function createQuoteService(db: Db): QuoteService {
   }
 
   return {
-    async createQuote(input) {
+    async createQuote(input, ownerId) {
       const q = await compute(input);
-      // Identical terms produce the identical hash; return the existing quote
-      // rather than failing on the unique constraint (idempotent re-quotes).
+      // Identical terms for the SAME identity produce the identical hash;
+      // return the existing quote rather than failing on the unique
+      // constraint (idempotent re-quotes). Different identities never share a
+      // row.
       const inserted = await db
         .insert(quotes)
         .values({
+          owner_id: ownerId ?? null,
           source_asset: q.sourceAsset,
           destination_asset: q.destinationAsset,
           source_amount_stroops: q.sourceAmountStroops,
@@ -243,6 +253,8 @@ export function createQuoteService(db: Db): QuoteService {
           route: q.route,
           price_impact_bps: q.priceImpactBps,
           quote_hash: q.quoteHash,
+          rate: q.rate,
+          rate_source: q.rateSource,
           expires_at: q.expiresAt,
         })
         .onConflictDoNothing()
@@ -253,7 +265,12 @@ export function createQuoteService(db: Db): QuoteService {
       const existing = await db
         .select({ id: quotes.id })
         .from(quotes)
-        .where(eq(quotes.quote_hash, q.quoteHash))
+        .where(
+          and(
+            ownerId ? eq(quotes.owner_id, ownerId) : isNull(quotes.owner_id),
+            eq(quotes.quote_hash, q.quoteHash),
+          ),
+        )
         .limit(1);
       return { ...q, id: existing[0]!.id };
     },
@@ -274,8 +291,9 @@ export function createQuoteService(db: Db): QuoteService {
         destinationAmountStroops: row.destination_amount_stroops,
         sourceCountry: row.source_country ?? undefined,
         destinationCountry: row.destination_country ?? undefined,
-        rate: '1.0',
-        rateSource: 'default',
+        // The rate is persisted at creation so reads match the create response.
+        rate: row.rate ?? '1.0',
+        rateSource: (row.rate_source as ComputedQuote['rateSource']) ?? 'default',
         fees: {
           platform: fromStroops(row.platform_fee_stroops),
           corridor: fromStroops(row.corridor_fee_stroops),
@@ -288,6 +306,7 @@ export function createQuoteService(db: Db): QuoteService {
         priceImpactBps: row.price_impact_bps,
         expiresAt: row.expires_at,
         quoteHash: row.quote_hash,
+        usedAt: row.used_at ?? undefined,
       };
     },
 
@@ -295,6 +314,9 @@ export function createQuoteService(db: Db): QuoteService {
       const q = await this.getQuote(quoteId);
       if (q.expiresAt.getTime() <= Date.now()) {
         throw unprocessable('Quote has expired', { quote_id: quoteId });
+      }
+      if (q.usedAt) {
+        throw unprocessable('Quote has already been used', { quote_id: quoteId });
       }
       if (
         expected.sourceAsset &&
@@ -312,6 +334,16 @@ export function createQuoteService(db: Db): QuoteService {
         throw unprocessable('Quote source amount mismatch');
       }
       return q;
+    },
+
+    async claim(quoteId) {
+      // Atomic single-use: only the first caller flips used_at NULL -> now().
+      const claimed = await db
+        .update(quotes)
+        .set({ used_at: new Date() })
+        .where(and(eq(quotes.id, quoteId), isNull(quotes.used_at)))
+        .returning({ id: quotes.id });
+      return claimed.length > 0;
     },
   };
 }

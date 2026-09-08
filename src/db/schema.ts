@@ -91,24 +91,39 @@ export const anchorAssets = pgTable(
   (t) => [uniqueIndex('anchor_assets_anchor_code_issuer_idx').on(t.anchor_id, t.code, t.issuer)],
 );
 
-export const quotes = pgTable('quotes', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  source_asset: text('source_asset').notNull(), // 'USDC:G...' or 'native'
-  destination_asset: text('destination_asset').notNull(),
-  source_amount_stroops: bigint('source_amount_stroops', { mode: 'bigint' }).notNull(),
-  destination_amount_stroops: bigint('destination_amount_stroops', { mode: 'bigint' }).notNull(),
-  source_country: text('source_country'),
-  destination_country: text('destination_country'),
-  anchor_id: uuid('anchor_id').references(() => anchors.id),
-  platform_fee_stroops: bigint('platform_fee_stroops', { mode: 'bigint' }).notNull().default(0n),
-  corridor_fee_stroops: bigint('corridor_fee_stroops', { mode: 'bigint' }).notNull().default(0n),
-  anchor_fee_stroops: bigint('anchor_fee_stroops', { mode: 'bigint' }).notNull().default(0n),
-  route: text('route').notNull(),
-  price_impact_bps: integer('price_impact_bps').notNull().default(0),
-  quote_hash: text('quote_hash').notNull().unique(),
-  expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
-  created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const quotes = pgTable(
+  'quotes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    // Quotes belong to the identity that requested them; identical terms from
+    // two identities must not share a row. TEXT because the SEP-10 session
+    // subject is a users.id UUID for custodial sessions but a Stellar public
+    // key for non-custodial sessions.
+    owner_id: text('owner_id'),
+    source_asset: text('source_asset').notNull(), // 'USDC:G...' or 'native'
+    destination_asset: text('destination_asset').notNull(),
+    source_amount_stroops: bigint('source_amount_stroops', { mode: 'bigint' }).notNull(),
+    destination_amount_stroops: bigint('destination_amount_stroops', { mode: 'bigint' }).notNull(),
+    source_country: text('source_country'),
+    destination_country: text('destination_country'),
+    anchor_id: uuid('anchor_id').references(() => anchors.id),
+    platform_fee_stroops: bigint('platform_fee_stroops', { mode: 'bigint' }).notNull().default(0n),
+    corridor_fee_stroops: bigint('corridor_fee_stroops', { mode: 'bigint' }).notNull().default(0n),
+    anchor_fee_stroops: bigint('anchor_fee_stroops', { mode: 'bigint' }).notNull().default(0n),
+    route: text('route').notNull(),
+    price_impact_bps: integer('price_impact_bps').notNull().default(0),
+    quote_hash: text('quote_hash').notNull(),
+    // The effective FX rate and its source, persisted so reads match the
+    // create response and pricing is auditable.
+    rate: text('rate'),
+    rate_source: text('rate_source'),
+    // Set when a remittance is created from this quote — a quote is single-use.
+    used_at: timestamp('used_at', { withTimezone: true }),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('quotes_owner_hash_idx').on(t.owner_id, t.quote_hash)],
+);
 
 export const remittances = pgTable(
   'remittances',

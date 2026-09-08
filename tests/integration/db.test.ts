@@ -50,9 +50,10 @@ describe('database (migrations on pglite)', () => {
     expect(rem[0]!.status).toBe('CREATED');
   });
 
-  it('enforces unique quote hashes', async () => {
+  it('enforces unique quote hashes per owner', async () => {
     const db = await createTestDb();
     const values = {
+      owner_id: 'GOWNER1',
       source_asset: 'USDC:GX',
       destination_asset: 'NGN:GY',
       source_amount_stroops: 1n,
@@ -62,7 +63,12 @@ describe('database (migrations on pglite)', () => {
       expires_at: new Date(Date.now() + 60_000),
     };
     await db.insert(quotes).values(values);
+    // The same owner quoting identical terms again conflicts.
     await expect(db.insert(quotes).values(values)).rejects.toThrow();
+    // A different owner quoting identical terms is a separate quote.
+    await expect(
+      db.insert(quotes).values({ ...values, owner_id: 'GOWNER2' }),
+    ).resolves.toBeTruthy();
   });
 
   it('bigint stroops round-trip exactly', async () => {
