@@ -103,7 +103,11 @@ describe('HTTP API', () => {
       },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.json().quoteHash).toHaveLength(64);
+    const body = res.json();
+    expect(body.quoteHash).toHaveLength(64);
+    // Dates must serialize to ISO strings, not empty objects (regression:
+    // the BigInt pre-serializer used to flatten Date into {}).
+    expect(new Date(body.expiresAt).getTime()).toBeGreaterThan(Date.now());
   });
 
   it('returns 422 on validation errors', async () => {

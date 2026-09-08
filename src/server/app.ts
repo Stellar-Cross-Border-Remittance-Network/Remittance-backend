@@ -79,7 +79,10 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
     if (Array.isArray(value)) {
       return value.map(stringifyBigInts);
     }
-    if (value && typeof value === 'object') {
+    // Leave Date (and other non-plain objects) untouched so Fastify's
+    // serializer turns them into ISO strings. Rebuilding them from
+    // Object.entries would flatten a Date into an empty object.
+    if (value && typeof value === 'object' && value.constructor === Object) {
       return Object.fromEntries(
         Object.entries(value).map(([k, v]) => [k, stringifyBigInts(v)]),
       );
