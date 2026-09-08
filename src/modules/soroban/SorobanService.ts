@@ -139,6 +139,15 @@ export function createSorobanService(db: Db): SorobanService {
     return secret;
   }
 
+  /**
+   * The JSONB function_args column cannot store BigInt; the contract args
+   * contain BigInts (id, expiry), so convert them to strings before persisting.
+   * This is what makes every invocation recordable at all.
+   */
+  function jsonSafeArgs(args: Record<string, unknown>): Record<string, unknown> {
+    return JSON.parse(JSON.stringify(args, (_k, v) => (typeof v === 'bigint' ? v.toString() : v))) as Record<string, unknown>;
+  }
+
   async function record(
     method: string,
     remittanceId: string | undefined,
@@ -151,7 +160,7 @@ export function createSorobanService(db: Db): SorobanService {
         remittance_id: remittanceId ?? null,
         method,
         contract_id: env.CONTRACT_ID!,
-        function_args: args,
+        function_args: jsonSafeArgs(args),
         status: 'pending',
       })
       .returning({ id: sorobanTransactions.id });
@@ -351,7 +360,9 @@ export function createSorobanService(db: Db): SorobanService {
         };
       };
       const tx = new Transaction(signedXdr, env.NETWORK_PASSPHRASE);
-      const txHash = tx.hash().toString('hex');
+      // SDK v17 returns a Uint8Array from hash(); Buffer.from normalizes it
+      // so toString('hex') produces the 64-char hash RPC expects.
+      const txHash = Buffer.from(tx.hash()).toString('hex');
       const { rpc } = (await import('@stellar/stellar-sdk/rpc')) as unknown as {
         rpc: {
           Server: new (url: string) => {
