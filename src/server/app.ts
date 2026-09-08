@@ -16,6 +16,7 @@ import { registerSep6Routes } from '../modules/sep6/routes.js';
 import { registerSep10Routes } from '../modules/sep10/routes.js';
 import { registerSep24Routes } from '../modules/sep24/routes.js';
 import type { Container } from './container.js';
+import { requestSignaturePlugin } from './plugins/requestSignature.js';
 
 export async function buildApp(container: Container): Promise<FastifyInstance> {
   const env = loadEnv();
@@ -39,6 +40,8 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
     trustProxy: true,
     bodyLimit: 1_048_576,
   });
+
+  const requireSignature = await requestSignaturePlugin(app);
 
   await app.register(sensible);
   await app.register(cors, { origin: true });
@@ -142,7 +145,7 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
   app.register(async (authed) => {
     await authed.register(authPlugin);
     registerAnchorRoutes(authed, container);
-    registerRemittanceRoutes(authed, container);
+    registerRemittanceRoutes(authed, container, { requireSignature });
     registerSep24Routes(authed, container);
     registerSep6Routes(authed, container);
   });

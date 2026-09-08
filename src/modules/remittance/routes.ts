@@ -1,9 +1,14 @@
 import { eq } from 'drizzle-orm';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, preHandlerHookHandler } from 'fastify';
 import { z } from 'zod';
 
 import { remittances, streamCursors } from '../../db/schema.js';
 import type { Container } from '../../server/container.js';
+
+interface RouteOptions {
+  /** PreHandler factory from the request-signature plugin (internal ops). */
+  requireSignature?: () => preHandlerHookHandler;
+}
 
 const quoteBody = z.object({
   source_asset: z.string().min(1),
@@ -28,7 +33,7 @@ const confirmBody = z.object({
   method: z.enum(['create_remittance', 'fund_remittance']),
 });
 
-export function registerRemittanceRoutes(app: FastifyInstance, c: Container): void {
+export function registerRemittanceRoutes(app: FastifyInstance, c: Container, opts: RouteOptions = {}): void {
   app.post('/v1/remittances/quote', {
     schema: {
       tags: ['remittances'],
@@ -165,7 +170,8 @@ export function registerRemittanceRoutes(app: FastifyInstance, c: Container): vo
   });
 
   app.post('/v1/internal/reconcile', {
-    schema: { tags: ['internal'], summary: 'Trigger a polling reconciliation pass' },
+    schema: { tags: ['internal'], summary: 'Trigger a polling reconciliation pass (signed)' },
+    ...(opts.requireSignature ? { preHandler: [opts.requireSignature()] } : {}),
   }, async () => {
     const accounts = (await c.db.select().from(streamCursors)).map((r) => r.account);
     const processed = await c.reconciler.reconcileAll(accounts);

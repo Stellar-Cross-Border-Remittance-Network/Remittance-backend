@@ -73,6 +73,10 @@ const EnvSchema = z.object({
   POLL_RECONCILE_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
   ALLOW_INSECURE_HTTP: bool(false),
 
+  // Request signing (HMAC over method/path/timestamp/body-hash)
+  REQUEST_SIGNING_SECRET: z.string().optional().describe('Shared secret for signed internal/webhook requests'),
+  REQUEST_SIGNING_CLOCK_SKEW_MS: z.coerce.number().int().min(0).default(300_000),
+
   // Observability
   OTEL_ENABLED: bool(false),
   OTEL_EXPORTER_OTLP_ENDPOINT: optionalUrl,
