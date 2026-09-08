@@ -24,6 +24,14 @@ export interface JobManager {
   /** Route a streamed payment event; falls back to inline processing when Redis is down. */
   enqueuePaymentEvent(remittanceId: string, event: NormalizedPayment): Promise<void>;
   enqueueAnchorStatusPoll(): Promise<void>;
+  /**
+   * Expire CREATED remittances and auto-refund FUNDED/PROCESSING ones past
+   * their business expiry. Exposed so ops can trigger a pass on demand and so
+   * the scheduler worker and tests share one code path.
+   */
+  runExpirySweep(): Promise<number>;
+  /** Poll pending anchor transactions and settle completed ones. */
+  pollAnchorTransactions(): Promise<number>;
 }
 
 interface Services {
@@ -185,6 +193,14 @@ export function createJobManager(
 
     async enqueueAnchorStatusPoll() {
       await queue?.add(JOB_ANCHOR_POLL, {}, { attempts: 1 });
+    },
+
+    runExpirySweep() {
+      return expirySweep();
+    },
+
+    pollAnchorTransactions() {
+      return anchorPoll();
     },
   };
 }

@@ -20,7 +20,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
-      - run: pnpm test
+      # Coverage thresholds (80% lines/functions/statements) are enforced in
+      # vitest.config.ts, so this is the coverage gate, not just a test run.
+      - run: pnpm test:coverage
 
   # Testnet integration smoke (requires secrets; skipped on forks/PRs).
   testnet-integration:
