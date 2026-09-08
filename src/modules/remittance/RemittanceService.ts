@@ -14,10 +14,10 @@ import {
   type Remittance,
 } from '../../db/schema.js';
 import { fromStroops, toStroops } from '../../lib/amounts.js';
-import { badRequest, conflict, forbidden, notFound, unprocessable } from '../../lib/errors.js';
+import { badRequest, conflict, forbidden, notFound, unprocessable, upstream } from '../../lib/errors.js';
 import type { QuoteService } from '../quotes/QuoteService.js';
 import type { SorobanService, ContractCommitment, Signer } from '../soroban/SorobanService.js';
-import type { NormalizedPayment } from '../horizon/payments.js';
+import { matchesSettlementEvent, type NormalizedPayment } from '../horizon/payments.js';
 import {
   canTransition,
   isRemittanceStatus,
@@ -29,7 +29,10 @@ export const MAX_CONTRACT_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 export interface CreateRemittanceInput {
   quoteId: string;
-  senderAccountId: string;
+  /** Optional: the sender's registered account id. When omitted the
+   * user's default account is resolved from the session (the mobile app
+   * relies on this). */
+  senderAccountId?: string;
   /** Off-chain destination identifier (phone / bank / wallet id). */
   recipientAddress: string;
   /** Stellar account that receives the released escrow (release pays this). */
@@ -59,6 +62,22 @@ export interface RemittanceService {
     input: { txHash: string; method: 'create_remittance' | 'fund_remittance' },
     userId: string,
   ): Promise<void>;
+  /** Non-custodial path: prepare the fund_remittance envelope for on-device signing. */
+  prepareFund(id: string, userId: string): Promise<{ transactionXdr: string }>;
+  /** Non-custodial path: prepare the sender-cancel refund envelope for on-device signing. */
+  prepareRefund(id: string, userId: string): Promise<{ transactionXdr: string }>;
+  /**
+   * Relay a client-signed envelope: submit to RPC, wait for confirmation, then
+   * verify the on-chain contract state actually moved and reconcile the DB.
+   * The post-execution state check is what makes relaying safe — a malicious
+   * or mis-signed envelope can never advance the database state.
+   */
+  relay(
+    id: string,
+    input: { signedXdr: string; method: 'create_remittance' | 'fund_remittance' | 'refund' },
+    userId: string,
+  ): Promise<void>;
+
   /** Called by the anchor-transfer routes once a SEP transaction exists. */
   onAnchorTransferStarted(id: string): Promise<void>;
   /** Called by the payment streamer/reconciler for every new normalized event. */
@@ -101,6 +120,27 @@ export function createRemittanceService(
       .limit(1);
     if (rows.length === 0) {
       throw notFound('Sender Stellar account not found');
+    }
+    return rows[0]!;
+  }
+
+  /**
+   * Resolve the sender's account from the session when the client did not
+   * pass an explicit account id: prefer the user's default account, falling
+   * back to their only (or most recently created) account.
+   */
+  async function resolveSenderAccount(accountId: string | undefined, userId: string) {
+    if (accountId) {
+      return loadSenderAccount(accountId, userId);
+    }
+    const rows = await db
+      .select()
+      .from(stellarAccounts)
+      .where(eq(stellarAccounts.user_id, userId))
+      .orderBy(desc(stellarAccounts.is_default), desc(stellarAccounts.created_at))
+      .limit(1);
+    if (rows.length === 0) {
+      throw notFound('No Stellar account registered for this user');
     }
     return rows[0]!;
   }
@@ -166,6 +206,54 @@ export function createRemittanceService(
     return { publicKey: account.public_key, secretEncrypted: account.secret_encrypted };
   }
 
+  /**
+   * Shared post-submission reconciliation used by the confirm endpoint (the
+   * app submitted the tx itself) and the relay endpoint (the backend
+   * submitted it). Waits for the tx, reconciles the on-chain create id, then
+   * advances the database state for fund/refund.
+   */
+  async function confirm(
+    id: string,
+    txHash: string,
+    method: 'create_remittance' | 'fund_remittance' | 'refund',
+    userId: string,
+    /** Post-finality, pre-state-update verification (used by the relay path). */
+    verify?: () => Promise<void>,
+  ): Promise<void> {
+    const r = await loadOwned(id, userId);
+    await soroban.waitForTransaction(txHash);
+    await verify?.();
+    if (method === 'create_remittance' && !r.contract_remittance_id) {
+      // Reconcile: ids are monotonic — the newest record must be ours if the
+      // sender and quote hash match.
+      const count = await soroban.remittanceCount();
+      const candidate = (await soroban.getRemittance(String(count - 1))) as Record<string, unknown>;
+      const quote = await quotesService.getQuote(r.quote_id!);
+      const account = await loadSenderAccount(r.sender_account_id!, userId);
+      if (
+        String(candidate.sender ?? '') === account.public_key &&
+        String(candidate.quote_hash ?? '') === quote.quoteHash
+      ) {
+        await db
+          .update(remittances)
+          .set({ contract_remittance_id: String(count - 1), updated_at: new Date() })
+          .where(eq(remittances.id, r.id));
+      } else {
+        throw unprocessable('On-chain remittance does not match this commitment');
+      }
+    }
+    if (method === 'fund_remittance' && r.status === 'CREATED') {
+      await setState(r.id, 'FUNDED', 'TRANSFER_INITIATED');
+    }
+    if (method === 'refund' && (r.status === 'FUNDED' || r.status === 'PROCESSING')) {
+      await setState(r.id, 'REFUNDED', 'REFUNDED');
+    }
+    await db
+      .update(sorobanTransactions)
+      .set({ tx_hash: txHash, status: 'confirmed', updated_at: new Date() })
+      .where(and(eq(sorobanTransactions.remittance_id, r.id), eq(sorobanTransactions.method, method)));
+  }
+
   return {
     async create(input, userId) {
       const quote = await quotesService.assertUsable(input.quoteId, {
@@ -173,7 +261,7 @@ export function createRemittanceService(
         destinationAsset: undefined,
         sourceAmount: undefined,
       });
-      const account = await loadSenderAccount(input.senderAccountId, userId);
+      const account = await resolveSenderAccount(input.senderAccountId, userId);
       if (input.recipientStellarAccount === account.public_key) {
         throw badRequest('Recipient must differ from sender');
       }
@@ -184,12 +272,19 @@ export function createRemittanceService(
         Math.min(quote.expiresAt.getTime(), Date.now() + MAX_CONTRACT_TTL_SECONDS * 1000),
       );
 
+      // One accepted quote backs exactly one remittance. The atomic claim
+      // (used_at NULL -> now) is what enforces single-use under concurrency;
+      // assertUsable above is the fast-path freshness/usage check.
+      if (!(await quotesService.claim(input.quoteId))) {
+        throw conflict('Quote has already been used', { quote_id: input.quoteId });
+      }
+
       const inserted = await db
         .insert(remittances)
         .values({
           quote_id: input.quoteId,
           sender_user_id: userId,
-          sender_account_id: input.senderAccountId,
+          sender_account_id: account.id,
           recipient_address: input.recipientAddress,
           recipient_stellar_account: input.recipientStellarAccount,
           source_asset: quote.sourceAsset,
@@ -421,34 +516,84 @@ export function createRemittanceService(
     },
 
     async confirmSorobanSubmission(id, { txHash, method }, userId) {
+      await confirm(id, txHash, method, userId);
+    },
+
+    async prepareFund(id, userId) {
       const r = await loadOwned(id, userId);
-      await soroban.waitForTransaction(txHash);
-      if (method === 'create_remittance' && !r.contract_remittance_id) {
-        // Reconcile: ids are monotonic — the newest record must be ours if the
-        // sender and quote hash match.
-        const count = await soroban.remittanceCount();
-        const candidate = (await soroban.getRemittance(String(count - 1))) as Record<string, unknown>;
-        const quote = await quotesService.getQuote(r.quote_id!);
-        const account = await loadSenderAccount(r.sender_account_id!, userId);
-        if (
-          String(candidate.sender ?? '') === account.public_key &&
-          String(candidate.quote_hash ?? '') === quote.quoteHash
-        ) {
-          await db
-            .update(remittances)
-            .set({ contract_remittance_id: String(count - 1), updated_at: new Date() })
-            .where(eq(remittances.id, r.id));
-        } else {
-          throw unprocessable('On-chain remittance does not match this commitment');
+      if (r.status !== 'CREATED') {
+        throw conflict(`Cannot fund remittance in state ${r.status}`);
+      }
+      if (r.expiry.getTime() <= Date.now()) {
+        throw unprocessable('Remittance has expired', { id });
+      }
+      if (!r.contract_remittance_id) {
+        throw conflict('Remittance has not been created on-chain');
+      }
+      const account = await loadSenderAccount(r.sender_account_id!, userId);
+      if (account.secret_encrypted) {
+        // Custodial accounts are signed and submitted server-side via fund().
+        throw conflict('Custodial accounts are funded server-side');
+      }
+      const transactionXdr = await soroban.prepareFundRemittance(r.contract_remittance_id, account.public_key);
+      await db.insert(sorobanTransactions).values({
+        remittance_id: r.id,
+        method: 'fund_remittance',
+        contract_id: env.CONTRACT_ID ?? '',
+        function_args: { id: r.contract_remittance_id },
+        status: 'pending',
+      });
+      return { transactionXdr };
+    },
+
+    async prepareRefund(id, userId) {
+      const r = await loadOwned(id, userId);
+      if (r.status !== 'FUNDED') {
+        throw conflict(`Only a funded remittance can be cancelled before processing (state ${r.status})`);
+      }
+      if (r.expiry.getTime() <= Date.now()) {
+        // Expired refunds are permissionless on-chain; the server signs those.
+        throw conflict('Expired remittances are refunded server-side');
+      }
+      const account = await loadSenderAccount(r.sender_account_id!, userId);
+      if (account.secret_encrypted) {
+        throw conflict('Custodial accounts are refunded server-side');
+      }
+      const transactionXdr = await soroban.prepareRefund(r.contract_remittance_id!, account.public_key);
+      await db.insert(sorobanTransactions).values({
+        remittance_id: r.id,
+        method: 'refund',
+        contract_id: env.CONTRACT_ID ?? '',
+        function_args: { id: r.contract_remittance_id },
+        status: 'pending',
+      });
+      return { transactionXdr };
+    },
+
+    async relay(id, { signedXdr, method }, userId) {
+      const r = await loadOwned(id, userId);
+      if (method === 'create_remittance' && r.contract_remittance_id) {
+        throw conflict('Remittance already created on-chain');
+      }
+      const { txHash } = await soroban.submitEnvelope(signedXdr);
+      await confirm(id, txHash, method, userId, async () => {
+        // Post-finality, pre-update verification: the contract must actually
+        // be in the state the relayed call was supposed to produce, or the
+        // database state must NOT advance. This is what makes relaying safe
+        // against mis-signed or malicious envelopes.
+        if (method === 'fund_remittance') {
+          const status = await soroban.statusOf(r.contract_remittance_id!);
+          if (status !== 'Funded') {
+            throw upstream(`Relayed fund transaction did not fund the escrow (contract status: ${status})`);
+          }
         }
-      }
-      if (method === 'fund_remittance' && r.status === 'CREATED') {
-        await setState(r.id, 'FUNDED', 'TRANSFER_INITIATED');
-      }
-      await db
-        .update(sorobanTransactions)
-        .set({ tx_hash: txHash, status: 'confirmed', updated_at: new Date() })
-        .where(and(eq(sorobanTransactions.remittance_id, r.id), eq(sorobanTransactions.method, method)));
+        if (method === 'refund') {
+          const status = await soroban.statusOf(r.contract_remittance_id!);
+          if (status !== 'Refunded') {
+            throw upstream(`Relayed refund transaction did not refund the escrow (contract status: ${status})`);
+          }
+        }
+      });
     },
 
     async onAnchorTransferStarted(id) {
@@ -465,16 +610,28 @@ export function createRemittanceService(
         return;
       }
       const r = rows[0]!;
-      const isToRecipient = event.to === r.recipient_stellar_account;
-      const isPathPayment = event.type === 'path_payment';
-      if (isPathPayment && isToRecipient && r.lifecycle === 'TRANSFER_INITIATED') {
+      // Only a payment that plausibly settles THIS remittance may advance the
+      // feed: right recipient, committed destination asset, at least the
+      // committed destination amount. A random payment to the recipient (or a
+      // payment in the wrong asset) must not flip the live status.
+      const isSettlement = matchesSettlementEvent(
+        event,
+        r.recipient_stellar_account ?? '',
+        r.destination_asset,
+        r.expected_destination_amount_stroops,
+        toStroops,
+      );
+      if (!isSettlement) {
+        return;
+      }
+      if (event.type === 'path_payment' && r.lifecycle === 'TRANSFER_INITIATED') {
         await db
           .update(remittances)
           .set({ lifecycle: 'STELLAR_PAYMENT_SUBMITTED', updated_at: new Date() })
           .where(eq(remittances.id, r.id));
         return;
       }
-      if (isToRecipient && r.lifecycle === 'STELLAR_PAYMENT_SUBMITTED') {
+      if (r.lifecycle === 'STELLAR_PAYMENT_SUBMITTED') {
         await db
           .update(remittances)
           .set({ lifecycle: 'STELLAR_PAYMENT_CONFIRMED', updated_at: new Date() })

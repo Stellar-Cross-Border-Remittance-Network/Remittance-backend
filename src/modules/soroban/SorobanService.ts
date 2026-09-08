@@ -57,6 +57,16 @@ export interface SorobanService {
   waitForTransaction(txHash: string, timeoutMs?: number): Promise<void>;
   /** Non-custodial path: prepare an unsigned envelope for the client to sign. */
   prepareCreateRemittance(commitment: ContractCommitment, senderPublicKey: string): Promise<string>;
+  /** Non-custodial path: prepare the fund_remittance envelope for the sender to sign. */
+  prepareFundRemittance(contractRemittanceId: string, senderPublicKey: string): Promise<string>;
+  /** Non-custodial path: prepare the refund envelope (sender cancel, pre-processing) for signing. */
+  prepareRefund(contractRemittanceId: string, senderPublicKey: string): Promise<string>;
+  /**
+   * Submit a client-signed envelope to RPC and wait for confirmation. Used by
+   * the relay endpoint: the app signs on-device, the backend submits and
+   * verifies on-chain state afterwards.
+   */
+  submitEnvelope(signedXdr: string, timeoutMs?: number): Promise<{ txHash: string }>;
 }
 
 /** Generate the Stellar Asset Contract address for a classic asset. */
@@ -73,13 +83,18 @@ function parseClassic(spec: string): Asset {
   return new Asset(match[1]!, match[2]!);
 }
 
+type Assembled = {
+  signAndSend(): Promise<{ result?: unknown }>;
+  toXDR(): string;
+};
+
 type ContractClientLike = {
-  create_remittance(args: Record<string, unknown>): Promise<{ signAndSend(): Promise<{ result?: unknown }>; toXDR(): string }>;
-  fund_remittance(args: Record<string, unknown>): Promise<{ signAndSend(): Promise<{ result?: unknown }> }>;
-  begin_processing(args: Record<string, unknown>): Promise<{ signAndSend(): Promise<{ result?: unknown }> }>;
-  authorize_settlement(args: Record<string, unknown>): Promise<{ signAndSend(): Promise<{ result?: unknown }> }>;
-  release(args: Record<string, unknown>): Promise<{ signAndSend(): Promise<{ result?: unknown }> }>;
-  refund(args: Record<string, unknown>): Promise<{ signAndSend(): Promise<{ result?: unknown }> }>;
+  create_remittance(args: Record<string, unknown>): Promise<Assembled>;
+  fund_remittance(args: Record<string, unknown>): Promise<Assembled>;
+  begin_processing(args: Record<string, unknown>): Promise<Assembled>;
+  authorize_settlement(args: Record<string, unknown>): Promise<Assembled>;
+  release(args: Record<string, unknown>): Promise<Assembled>;
+  refund(args: Record<string, unknown>): Promise<Assembled>;
   get_remittance(args: Record<string, unknown>): Promise<{ result?: unknown }>;
   status_of(args: Record<string, unknown>): Promise<{ result?: unknown }>;
   remittance_count(args: Record<string, unknown>): Promise<{ result?: unknown }>;
@@ -313,6 +328,46 @@ export function createSorobanService(db: Db): SorobanService {
       const client = await clientFor({ publicKey: senderPublicKey });
       const tx = await client.create_remittance(args);
       return tx.toXDR();
+    },
+
+    async prepareFundRemittance(contractRemittanceId, senderPublicKey) {
+      const args = { sender: new Address(senderPublicKey).toString(), id: BigInt(contractRemittanceId) };
+      const client = await clientFor({ publicKey: senderPublicKey });
+      const tx = await client.fund_remittance(args);
+      return tx.toXDR();
+    },
+
+    async prepareRefund(contractRemittanceId, senderPublicKey) {
+      const args = { id: BigInt(contractRemittanceId) };
+      const client = await clientFor({ publicKey: senderPublicKey });
+      const tx = await client.refund(args);
+      return tx.toXDR();
+    },
+
+    async submitEnvelope(signedXdr, timeoutMs = 90_000) {
+      const { Transaction } = (await import('@stellar/stellar-sdk')) as unknown as {
+        Transaction: new (xdr: string, passphrase: string) => {
+          hash(): Buffer;
+        };
+      };
+      const tx = new Transaction(signedXdr, env.NETWORK_PASSPHRASE);
+      const txHash = tx.hash().toString('hex');
+      const { rpc } = (await import('@stellar/stellar-sdk/rpc')) as unknown as {
+        rpc: {
+          Server: new (url: string) => {
+            sendTransaction(tx: unknown): Promise<{ status: string; hash?: string; errorResult?: unknown }>;
+          };
+        };
+      };
+      const server = new rpc.Server(env.RPC_URL);
+      const res = await server.sendTransaction(tx as unknown);
+      if (res.status === 'ERROR') {
+        throw upstream('Relayed Soroban transaction was rejected', { txHash, errorResult: res.errorResult });
+      }
+      if (res.status === 'PENDING' || res.status === 'DUPLICATE' || res.status === 'TRY_AGAIN_LATER') {
+        await this.waitForTransaction(txHash, timeoutMs);
+      }
+      return { txHash };
     },
   };
 }

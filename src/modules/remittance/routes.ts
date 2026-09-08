@@ -1,8 +1,8 @@
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import type { FastifyInstance, preHandlerHookHandler } from 'fastify';
 import { z } from 'zod';
 
-import { remittances, streamCursors } from '../../db/schema.js';
+import { remittances, stellarAccounts, streamCursors } from '../../db/schema.js';
 import type { Container } from '../../server/container.js';
 
 interface RouteOptions {
@@ -21,7 +21,9 @@ const quoteBody = z.object({
 
 const createBody = z.object({
   quote_id: z.string().uuid(),
-  sender_account_id: z.string().uuid(),
+  // Optional — the backend resolves the user's default account when omitted
+  // (the mobile app relies on this).
+  sender_account_id: z.string().uuid().optional(),
   recipient_address: z.string().min(1),
   recipient_stellar_account: z.string().regex(/^G[A-Z0-9]{55}$/),
   anchor_id: z.string().uuid().optional(),
@@ -33,6 +35,11 @@ const confirmBody = z.object({
   method: z.enum(['create_remittance', 'fund_remittance']),
 });
 
+const relayBody = z.object({
+  signed_xdr: z.string().min(1),
+  method: z.enum(['create_remittance', 'fund_remittance', 'refund']),
+});
+
 export function registerRemittanceRoutes(app: FastifyInstance, c: Container, opts: RouteOptions = {}): void {
   app.post('/v1/remittances/quote', {
     schema: {
@@ -42,14 +49,17 @@ export function registerRemittanceRoutes(app: FastifyInstance, c: Container, opt
     },
   }, async (req) => {
     const body = quoteBody.parse(req.body);
-    return c.quotes.createQuote({
-      sourceAsset: body.source_asset,
-      destinationAsset: body.destination_asset,
-      sourceAmount: body.source_amount,
-      sourceCountry: body.source_country,
-      destinationCountry: body.destination_country,
-      anchorId: body.anchor_id,
-    });
+    return c.quotes.createQuote(
+      {
+        sourceAsset: body.source_asset,
+        destinationAsset: body.destination_asset,
+        sourceAmount: body.source_amount,
+        sourceCountry: body.source_country,
+        destinationCountry: body.destination_country,
+        anchorId: body.anchor_id,
+      },
+      req.session!.sub,
+    );
   });
 
   app.post('/v1/remittances', {
@@ -121,6 +131,40 @@ export function registerRemittanceRoutes(app: FastifyInstance, c: Container, opt
     return { ok: true };
   });
 
+  // Non-custodial path: prepare an envelope the app signs on-device, then
+  // relay the signed envelope back for submission + on-chain verification.
+  app.post('/v1/remittances/:id/prepare-fund', {
+    schema: {
+      tags: ['remittances'],
+      summary: 'Prepare the fund_remittance envelope for on-device signing (non-custodial)',
+    },
+  }, async (req) => {
+    const { id } = req.params as { id: string };
+    return c.remittance.prepareFund(id, req.session!.sub);
+  });
+
+  app.post('/v1/remittances/:id/prepare-refund', {
+    schema: {
+      tags: ['remittances'],
+      summary: 'Prepare the sender-cancel refund envelope for on-device signing (non-custodial)',
+    },
+  }, async (req) => {
+    const { id } = req.params as { id: string };
+    return c.remittance.prepareRefund(id, req.session!.sub);
+  });
+
+  app.post('/v1/remittances/:id/relay', {
+    schema: {
+      tags: ['remittances'],
+      summary: 'Submit a client-signed Soroban envelope and verify on-chain state (non-custodial)',
+      body: { type: 'object', required: ['signed_xdr', 'method'], properties: { signed_xdr: { type: 'string' }, method: { type: 'string' } } },
+    },
+  }, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = relayBody.parse(req.body);
+    return c.remittance.relay(id, { signedXdr: body.signed_xdr, method: body.method }, req.session!.sub);
+  });
+
   // Path payment planning (real Horizon paths only) — used by the app's send flow.
   app.post('/v1/path-payments/plan', {
     schema: {
@@ -154,11 +198,25 @@ export function registerRemittanceRoutes(app: FastifyInstance, c: Container, opt
     });
   });
 
-  // Reconciliation helpers for ops/audit.
+  // The app's activity feed: scoped to the authenticated session's Stellar
+  // account (the SEP-10 session `account` claim). Never expose other users'
+  // remittances through an authenticated endpoint.
   app.get('/v1/internal/remittances', {
-    schema: { tags: ['internal'] },
-  }, async () => {
-    const rows = await c.db.select().from(remittances);
+    schema: { tags: ['internal'], summary: 'The caller\u2019s own remittances (activity feed)' },
+  }, async (req) => {
+    const account = req.session!.account ?? req.session!.sub;
+    const accountRows = await c.db
+      .select({ id: stellarAccounts.id })
+      .from(stellarAccounts)
+      .where(eq(stellarAccounts.public_key, account))
+      .limit(1);
+    if (accountRows.length === 0) {
+      return [];
+    }
+    const rows = await c.db
+      .select()
+      .from(remittances)
+      .where(inArray(remittances.sender_account_id, accountRows.map((r) => r.id)));
     return rows.map((r) => ({ id: r.id, status: r.status, lifecycle: r.lifecycle, contract_remittance_id: r.contract_remittance_id }));
   });
 

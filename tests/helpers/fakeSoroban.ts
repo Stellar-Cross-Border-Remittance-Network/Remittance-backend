@@ -8,6 +8,9 @@ import type { ContractCommitment, Signer, SorobanService } from '../../src/modul
 export function createFakeSoroban() {
   const records = new Map<string, { commitment: ContractCommitment; status: string }>();
   const calls: string[] = [];
+  let lastCommitment: ContractCommitment | undefined;
+  // Models the on-chain effect of a prepared, signed + relayed transaction.
+  let pendingEffect: { id: string; status: string } | undefined;
   let count = 0;
   let txPending = true;
 
@@ -23,6 +26,7 @@ export function createFakeSoroban() {
     },
     async createRemittance(commitment, _signer) {
       calls.push('create_remittance');
+      lastCommitment = commitment;
       const id = String(count++);
       records.set(id, { commitment, status: 'Created' });
       return { id };
@@ -91,12 +95,41 @@ export function createFakeSoroban() {
       records.set(id, { commitment: { ...commitment, sender: senderPublicKey }, status: 'Created' });
       return 'AAAAAgAAAABwcHJlcGFyZWRfdHh4';
     },
+    async prepareFundRemittance(id, _senderPublicKey) {
+      calls.push(`prepare_fund:${id}`);
+      pendingEffect = { id, status: 'Funded' };
+      return 'AAAAAgAAAABwcmVwYXJlZF9mdW5k'; // dummy envelope
+    },
+    async prepareRefund(id, _senderPublicKey) {
+      calls.push(`prepare_refund:${id}`);
+      pendingEffect = { id, status: 'Refunded' };
+      return 'AAAAAgAAAABwcmVwYXJlZF9yZWZ1bmQ='; // dummy envelope
+    },
+    async submitEnvelope(_signedXdr) {
+      calls.push('submit_envelope');
+      if (txPending) {
+        throw new Error('transaction not confirmed');
+      }
+      // Apply the on-chain effect of the prepared call, like a real ledger
+      // would after the signed tx is included.
+      if (pendingEffect) {
+        const rec = records.get(pendingEffect.id);
+        if (rec) {
+          rec.status = pendingEffect.status;
+        }
+        pendingEffect = undefined;
+      }
+      return { txHash: 'relayed-tx-hash' };
+    },
   };
 
   return {
     fake,
     records,
     calls,
+    get lastCommitment() {
+      return lastCommitment;
+    },
     setTxConfirmed() {
       txPending = false;
     },

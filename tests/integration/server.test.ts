@@ -132,4 +132,68 @@ describe('HTTP API', () => {
     // Authed scope: no token -> 401 before the handler runs.
     expect(res.statusCode).toBe(401);
   });
+
+  it('scopes /v1/internal/remittances to the session account', async () => {
+    const { users, stellarAccounts, remittances } = await import('../../src/db/schema.js');
+    const kp = Keypair.random();
+    const otherKp = Keypair.random();
+
+    const user = await container.db.insert(users).values({ email: 'scope@example.com' }).returning({ id: users.id });
+    const account = await container.db
+      .insert(stellarAccounts)
+      .values({ user_id: user[0]!.id, public_key: kp.publicKey(), custody_model: 'non_custodial' })
+      .returning({ id: stellarAccounts.id });
+    // Another user's remittance that must never appear in the first user's feed.
+    const stranger = await container.db.insert(users).values({ email: 'stranger@example.com' }).returning({ id: users.id });
+    const strangerAccount = await container.db
+      .insert(stellarAccounts)
+      .values({ user_id: stranger[0]!.id, public_key: otherKp.publicKey() })
+      .returning({ id: stellarAccounts.id });
+
+    const base = {
+      recipient_address: 'r',
+      recipient_stellar_account: otherKp.publicKey(),
+      source_asset: 'USDC:GUSDC',
+      source_amount_stroops: 10000000n,
+      destination_asset: 'NGN:GNGN',
+      expected_destination_amount_stroops: 995000000n,
+      corridor: 'US/NG',
+      quote_hash: 'a'.repeat(64),
+      expiry: new Date(Date.now() + 60_000),
+    };
+    await container.db.insert(remittances).values({ ...base, sender_user_id: user[0]!.id, sender_account_id: account[0]!.id });
+    await container.db.insert(remittances).values({
+      ...base,
+      sender_user_id: stranger[0]!.id,
+      sender_account_id: strangerAccount[0]!.id,
+      quote_hash: 'b'.repeat(64),
+    });
+
+    // Session for the first user (SEP-10 with their keypair).
+    const challenge = await app.inject({
+      method: 'POST',
+      url: '/v1/sep10/challenge',
+      payload: { account: kp.publicKey() },
+    });
+    const { transaction, network_passphrase } = challenge.json();
+    const tx = new Transaction(transaction, network_passphrase);
+    tx.sign(kp);
+    const verify = await app.inject({
+      method: 'POST',
+      url: '/v1/sep10/verify',
+      payload: { transaction: tx.toXDR(), account: kp.publicKey() },
+    });
+    const token = verify.json().token as string;
+
+    const mine = await app.inject({
+      method: 'GET',
+      url: '/v1/internal/remittances',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(mine.statusCode).toBe(200);
+    const rows = mine.json() as Array<{ id: string }>;
+    // Only the caller's own remittance — the stranger's must be excluded.
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.id).toBeTruthy();
+  });
 });
