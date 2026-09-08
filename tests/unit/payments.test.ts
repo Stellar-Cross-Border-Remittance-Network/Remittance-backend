@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { normalizePayment, persistEvents, remittancesForAccount } from '../../src/modules/horizon/payments.js';
+import {
+  matchesSettlementEvent,
+  normalizePayment,
+  persistEvents,
+  remittancesForAccount,
+} from '../../src/modules/horizon/payments.js';
+import { toStroops } from '../../src/lib/amounts.js';
 import { createTestDb } from '../helpers/testDb.js';
 
 describe('payment normalization', () => {
@@ -29,7 +35,7 @@ describe('payment normalization', () => {
     });
   });
 
-  it('normalizes a path_payment with source assets', () => {
+  it('normalizes a path_payment with the destination side (what the recipient receives)', () => {
     const ev = normalizePayment(
       {
         type: 'path_payment',
@@ -47,9 +53,9 @@ describe('payment normalization', () => {
       },
       'GSENDER',
     );
-    expect(ev?.asset).toBe('USDC:GUSDC');
+    expect(ev?.asset).toBe('NGN:GNGN');
     expect(ev?.type).toBe('path_payment');
-    expect(ev?.amount).toBe('5.0000000');
+    expect(ev?.amount).toBe('7500.0000000');
   });
 
   it('ignores non-payment records', () => {
@@ -63,6 +69,47 @@ describe('payment normalization', () => {
       'GSOURCE',
     );
     expect(ev?.type).toBe('account_merge');
+  });
+});
+
+describe('settlement event matching', () => {
+  const recipient = 'GRECIP';
+  const dest = 'NGN:GNGN';
+  const expected = toStroops('99.5');
+
+  const base = {
+    cursor: '1',
+    account: 'GSENDER',
+    type: 'path_payment' as const,
+    from: 'GSENDER',
+    to: recipient,
+    asset: 'NGN:GNGN',
+    amount: '99.5',
+  };
+
+  it('accepts the committed payout', () => {
+    expect(matchesSettlementEvent(base, recipient, dest, expected, toStroops)).toBe(true);
+  });
+
+  it('accepts an overpayment (path strict-send surplus)', () => {
+    expect(matchesSettlementEvent({ ...base, amount: '100.0' }, recipient, dest, expected, toStroops)).toBe(true);
+  });
+
+  it('rejects a payment to a different account', () => {
+    expect(matchesSettlementEvent({ ...base, to: 'GOTHER' }, recipient, dest, expected, toStroops)).toBe(false);
+  });
+
+  it('rejects a payment in the wrong asset', () => {
+    expect(matchesSettlementEvent({ ...base, asset: 'USDC:GUSDC' }, recipient, dest, expected, toStroops)).toBe(false);
+  });
+
+  it('rejects a tiny dust payment even in the right asset', () => {
+    expect(matchesSettlementEvent({ ...base, amount: '0.0000001' }, recipient, dest, expected, toStroops)).toBe(false);
+  });
+
+  it('rejects events without an amount', () => {
+    const { amount: _amount, ...noAmount } = base;
+    expect(matchesSettlementEvent(noAmount, recipient, dest, expected, toStroops)).toBe(false);
   });
 });
 

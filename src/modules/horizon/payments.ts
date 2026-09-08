@@ -19,9 +19,55 @@ export interface NormalizedPayment {
   createdAt?: string;
 }
 
+/** Asset code portion of a 'CODE:ISSUER' spec, or the whole string if native. */
+export function assetCodeOf(asset: string | undefined): string | undefined {
+  if (!asset) {
+    return undefined;
+  }
+  return asset === 'XLM' ? 'XLM' : asset.split(':')[0]!.toUpperCase();
+}
+
+/**
+ * Whether a streamed payment event plausibly IS the settlement of the given
+ * remittance: it pays the recorded recipient, delivers the committed
+ * destination asset, and pays at least the committed destination amount.
+ *
+ * This prevents a random 1-stroop payment to the recipient (or a payment in
+ * the wrong asset) from advancing the live-status feed.
+ */
+export function matchesSettlementEvent(
+  event: NormalizedPayment,
+  recipientStellarAccount: string,
+  destinationAsset: string,
+  expectedDestinationStroops: bigint,
+  toStroopsFn: (human: string) => bigint,
+): boolean {
+  if (!event.to || event.to !== recipientStellarAccount) {
+    return false;
+  }
+  const want = assetCodeOf(destinationAsset);
+  const got = assetCodeOf(event.asset);
+  if (!want || !got || want !== got) {
+    return false;
+  }
+  if (!event.amount) {
+    return false;
+  }
+  try {
+    return toStroopsFn(event.amount) >= expectedDestinationStroops;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Normalize a raw Horizon payment record into our event shape. Handles both
  * `payment` and `path_payment` operation types.
+ *
+ * For `path_payment` the **destination side** is what the recipient actually
+ * receives, so destination amount/asset are preferred and source fields are
+ * only a fallback. Using the source side would misreport the payout and break
+ * settlement matching downstream.
  */
 export function normalizePayment(
   record: Record<string, unknown>,
@@ -31,9 +77,18 @@ export function normalizePayment(
   if (!['payment', 'path_payment', 'account_merge', 'create_account'].includes(type)) {
     return null;
   }
-  const assetType = (record.asset_type as string | undefined) ?? (record.source_asset_type as string | undefined);
-  const assetCode = (record.asset_code as string | undefined) ?? (record.source_asset_code as string | undefined);
-  const assetIssuer = (record.asset_issuer as string | undefined) ?? (record.source_asset_issuer as string | undefined);
+  const assetType =
+    (record.destination_asset_type as string | undefined) ??
+    (record.asset_type as string | undefined) ??
+    (record.source_asset_type as string | undefined);
+  const assetCode =
+    (record.destination_asset_code as string | undefined) ??
+    (record.asset_code as string | undefined) ??
+    (record.source_asset_code as string | undefined);
+  const assetIssuer =
+    (record.destination_asset_issuer as string | undefined) ??
+    (record.asset_issuer as string | undefined) ??
+    (record.source_asset_issuer as string | undefined);
   const asset =
     assetType === 'native'
       ? 'XLM'
@@ -43,7 +98,9 @@ export function normalizePayment(
 
   let amount = record.amount as string | undefined;
   if (type === 'path_payment' && amount === undefined) {
-    amount = (record.source_amount as string) ?? (record.destination_amount as string);
+    amount =
+      (record.destination_amount as string) ??
+      (record.source_amount as string);
   }
 
   return {
