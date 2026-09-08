@@ -117,5 +117,22 @@ surface (auth, validation, error codes, BigInt-safe serialization).
   on-chain record and matching sender + quote hash — never trusted blindly.
 - Anchor endpoints come from each anchor's published `stellar.toml`; the
   `ALLOW_INSECURE_HTTP` flag exists only for local development.
+- **Request signing** for machine-to-machine routes: HMAC-SHA256 over
+  method + path + timestamp + body hash (`X-Request-Signature` +
+  `X-Request-Timestamp` + `X-Request-Body-Hash`), constant-time verified with
+  a bounded clock-skew so replay is rejected. Enabled by setting
+  `REQUEST_SIGNING_SECRET` (required in production — internal ops routes fail
+  closed without it). See `src/lib/requestSigning.ts`.
+
+## Live Testnet integration tests
+
+`tests/testnet/live.test.ts` hits real Testnet (Horizon, Soroban RPC, the
+**deployed escrow contract**, and testanchor's stellar.toml via SEP-1).
+Skipped by default; run explicitly:
+
+```bash
+RUN_TESTNET_TESTS=1 CONTRACT_ID=CAA2LHIITEFNS5KL3H5ZLRVVR6BPUKWXCHKN5V6HMR4XLJBQZHRBT6QZ \
+  pnpm vitest run tests/testnet/live.test.ts
+```
 
 See also the threat model in `remittance-contracts/docs/SECURITY.md`.
