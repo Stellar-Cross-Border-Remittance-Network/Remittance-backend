@@ -10,6 +10,7 @@ import { authPlugin } from '../auth/guard.js';
 import { loadEnv } from '../config/env.js';
 import { users } from '../db/schema.js';
 import { isAppError } from '../lib/errors.js';
+import { registerAccountRoutes, registerCustodialAccountRoute } from '../modules/accounts/routes.js';
 import { registerAnchorRoutes } from '../modules/anchors/routes.js';
 import { registerRemittanceRoutes } from '../modules/remittance/routes.js';
 import { registerSep6Routes } from '../modules/sep6/routes.js';
@@ -136,14 +137,17 @@ export async function buildApp(container: Container): Promise<FastifyInstance> {
     return { status: 'ok', service: 'remittance-backend', network: env.NETWORK };
   });
 
-  // Public SEP-10 challenge/verify (auth issuance) + anchors list.
+  // Public SEP-10 challenge/verify (auth issuance) + custodial onboarding
+  // (rate-limited; no session exists yet).
   app.register(async (publicApp) => {
     registerSep10Routes(publicApp, container);
+    registerCustodialAccountRoute(publicApp, container);
   });
 
   // Everything else requires a session JWT.
   app.register(async (authed) => {
     await authed.register(authPlugin);
+    registerAccountRoutes(authed, container);
     registerAnchorRoutes(authed, container);
     registerRemittanceRoutes(authed, container, { requireSignature });
     registerSep24Routes(authed, container);

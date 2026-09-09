@@ -11,6 +11,7 @@ import {
   sorobanTransactions,
   stellarAccounts,
   stellarTransactions,
+  users,
   type Remittance,
 } from '../../db/schema.js';
 import { fromStroops, toStroops } from '../../lib/amounts.js';
@@ -96,6 +97,18 @@ export function createRemittanceService(
 ): RemittanceService {
   const env = loadEnv();
 
+  /**
+   * Map the SEP-10 session subject to a users.id. Custodial sessions carry
+   * the users.id directly; non-custodial sessions carry the Stellar public
+   * key, which the registration endpoint stores as users.subject. Without
+   * this resolution, non-custodial senders can never reach their account
+   * rows (or their remittances) because everything is FK'd to users.id.
+   */
+  async function resolveUserId(subject: string): Promise<string> {
+    const rows = await db.select({ id: users.id }).from(users).where(eq(users.subject, subject)).limit(1);
+    return rows[0]?.id ?? subject;
+  }
+
   function assertOwner(r: Remittance, userId: string): void {
     if (r.sender_user_id && r.sender_user_id !== userId) {
       throw forbidden('Not the owner of this remittance');
@@ -108,7 +121,7 @@ export function createRemittanceService(
       throw notFound('Remittance not found');
     }
     const r = rows[0]!;
-    assertOwner(r, userId);
+    assertOwner(r, await resolveUserId(userId));
     return r;
   }
 
@@ -116,7 +129,7 @@ export function createRemittanceService(
     const rows = await db
       .select()
       .from(stellarAccounts)
-      .where(and(eq(stellarAccounts.id, accountId), eq(stellarAccounts.user_id, userId)))
+      .where(and(eq(stellarAccounts.id, accountId), eq(stellarAccounts.user_id, await resolveUserId(userId))))
       .limit(1);
     if (rows.length === 0) {
       throw notFound('Sender Stellar account not found');
@@ -136,7 +149,7 @@ export function createRemittanceService(
     const rows = await db
       .select()
       .from(stellarAccounts)
-      .where(eq(stellarAccounts.user_id, userId))
+      .where(eq(stellarAccounts.user_id, await resolveUserId(userId)))
       .orderBy(desc(stellarAccounts.is_default), desc(stellarAccounts.created_at))
       .limit(1);
     if (rows.length === 0) {
@@ -262,6 +275,9 @@ export function createRemittanceService(
         sourceAmount: undefined,
       });
       const account = await resolveSenderAccount(input.senderAccountId, userId);
+      // sender_user_id is a users.id FK — never the raw session subject
+      // (non-custodial sessions carry the Stellar public key).
+      const ownerUserId = await resolveUserId(userId);
       if (input.recipientStellarAccount === account.public_key) {
         throw badRequest('Recipient must differ from sender');
       }
@@ -283,7 +299,7 @@ export function createRemittanceService(
         .insert(remittances)
         .values({
           quote_id: input.quoteId,
-          sender_user_id: userId,
+          sender_user_id: ownerUserId,
           sender_account_id: account.id,
           recipient_address: input.recipientAddress,
           recipient_stellar_account: input.recipientStellarAccount,
@@ -303,7 +319,7 @@ export function createRemittanceService(
 
       const r = inserted[0]!;
       await db.insert(auditEvents).values({
-        actor_id: userId,
+        actor_id: ownerUserId,
         action: 'remittance.create',
         resource_type: 'remittance',
         resource_id: r.id,

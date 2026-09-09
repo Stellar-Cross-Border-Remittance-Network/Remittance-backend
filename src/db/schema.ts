@@ -19,13 +19,17 @@ import {
 
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
+  // Stable identity for SEP-10 sessions whose JWT subject is a Stellar
+  // public key (non-custodial). Custodial sessions carry users.id directly
+  // and leave this NULL. Unique so one identity owns exactly one users row.
+  subject: text('subject'),
   email: text('email'),
   phone: text('phone'),
   role: text('role').notNull().default('user'), // 'user' | 'admin'
   status: text('status').notNull().default('active'), // 'active' | 'suspended'
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [uniqueIndex('users_subject_idx').on(t.subject)]);
 
 export const stellarAccounts = pgTable(
   'stellar_accounts',

@@ -66,7 +66,10 @@ export function registerRemittanceRoutes(app: FastifyInstance, c: Container, opt
     schema: {
       tags: ['remittances'],
       summary: 'Create a remittance from an accepted quote (invokes the Soroban contract)',
-      body: { type: 'object', required: ['quote_id', 'sender_account_id', 'recipient_address', 'recipient_stellar_account'] },
+      // sender_account_id is optional — the backend resolves the session's
+      // default account (the mobile app relies on this). The OpenAPI schema
+      // must mirror the Zod shape or Fastify rejects valid requests.
+      body: { type: 'object', required: ['quote_id', 'recipient_address', 'recipient_stellar_account'] },
     },
   }, async (req) => {
     const body = createBody.parse(req.body);
