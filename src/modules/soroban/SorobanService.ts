@@ -115,11 +115,15 @@ export function createSorobanService(db: Db): SorobanService {
       networkPassphrase: env.NETWORK_PASSPHRASE,
       contractId: env.CONTRACT_ID,
     };
-    if (signer?.secretEncrypted) {
+    // A public-key-only signer (non-custodial prepare flows) must still set
+    // `publicKey` — without it the SDK assembles the envelope from the NULL
+    // account (seq 0) and every relayed transaction fails with tx_bad_seq.
+    if (signer?.publicKey) {
       opts.publicKey = signer.publicKey;
+    }
+    if (signer?.secretEncrypted) {
       opts.secretKey = decryptSecret(signer.secretEncrypted);
     } else if (signer?.secret) {
-      opts.publicKey = signer.publicKey;
       opts.secretKey = signer.secret;
     }
     return new Client(opts);
@@ -195,11 +199,40 @@ export function createSorobanService(db: Db): SorobanService {
     };
   }
 
+  /**
+   * Bindings parse BytesN/Bytes fields as byte-index maps; reduce any of the
+   * possible representations (hex string, Buffer, Uint8Array, byte map) to a
+   * lowercase hex string.
+   */
+  function bytesToHex(value: unknown): string {
+    if (value == null) return '';
+    if (typeof value === 'string') return value.replace(/^0x/, '').toLowerCase();
+    if (Buffer.isBuffer(value)) return value.toString('hex');
+    if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
+    if (typeof value === 'object') {
+      const entries = Object.entries(value as Record<string, unknown>).sort(
+        ([a], [b]) => Number(a) - Number(b),
+      );
+      if (entries.length > 0 && entries.every(([, v]) => typeof v === 'number')) {
+        return Buffer.from(entries.map(([, v]) => Number(v))).toString('hex');
+      }
+    }
+    return String(value ?? '');
+  }
+
   function unwrapResult(value: unknown): unknown {
     // Contract functions return soroban-sdk `Result`; the generated client may
-    // surface it raw or as {ok: ...} depending on the SDK version.
-    if (value && typeof value === 'object' && 'ok' in value && !('sender' in value)) {
-      return (value as { ok: unknown }).ok;
+    // surface the Ok variant raw, as { ok: T }, or as { value: T } depending
+    // on the SDK version. Only unwrap single-key wrappers so multi-field
+    // records are never stripped.
+    if (value && typeof value === 'object') {
+      const v = value as Record<string, unknown>;
+      if ('value' in v && Object.keys(v).length === 1) {
+        return v.value;
+      }
+      if ('ok' in v && !('sender' in v) && Object.keys(v).length === 1) {
+        return v.ok;
+      }
     }
     return value;
   }
@@ -299,14 +332,24 @@ export function createSorobanService(db: Db): SorobanService {
       const client = await clientFor();
       const res = await client.get_remittance({ id: BigInt(contractRemittanceId) });
       const result = unwrapResult(res.result);
+      if (result && typeof result === 'object') {
+        const r = result as Record<string, unknown>;
+        // The generated bindings surface BytesN/Bytes fields as byte-index
+        // maps; normalize to hex so comparisons against DB hex strings work.
+        for (const key of ['quote_hash', 'corridor', 'destination_asset'] as const) {
+          if (r[key] !== undefined) r[key] = bytesToHex(r[key]);
+        }
+        return r;
+      }
       return (result as Record<string, unknown>) ?? {};
     },
 
     async waitForTransaction(txHash, timeoutMs = 90_000) {
-      const { rpc } = (await import('@stellar/stellar-sdk/rpc')) as unknown as {
-        rpc: { Server: new (url: string) => { getTransaction(hash: string): Promise<unknown> } };
+      // @stellar/stellar-sdk/rpc exports Server directly (no `rpc` namespace).
+      const { Server } = (await import('@stellar/stellar-sdk/rpc')) as unknown as {
+        Server: new (url: string) => { getTransaction(hash: string): Promise<unknown> };
       };
-      const server = new rpc.Server(env.RPC_URL);
+      const server = new Server(env.RPC_URL);
       const deadline = Date.now() + timeoutMs;
       let last: { status?: string; error?: string } | undefined;
       while (Date.now() < deadline) {
@@ -329,7 +372,23 @@ export function createSorobanService(db: Db): SorobanService {
     async statusOf(contractRemittanceId) {
       const client = await clientFor();
       const res = await client.status_of({ id: BigInt(contractRemittanceId) });
-      return String(unwrapResult(res.result) ?? 'UNKNOWN');
+      const raw = unwrapResult(res.result);
+      // The generated client renders the Status enum as its numeric
+      // discriminant (0..6); map back to the ABI name so callers can compare
+      // against 'Created' | 'Funded' | ... as documented.
+      const STATUS_NAMES = [
+        'Created',
+        'Funded',
+        'Processing',
+        'SettlementAuthorized',
+        'Released',
+        'Refunded',
+        'Expired',
+      ] as const;
+      if (typeof raw === 'number' && raw >= 0 && raw < STATUS_NAMES.length) {
+        return STATUS_NAMES[raw]!;
+      }
+      return String(raw ?? 'UNKNOWN');
     },
 
     async prepareCreateRemittance(commitment, senderPublicKey) {
@@ -363,14 +422,12 @@ export function createSorobanService(db: Db): SorobanService {
       // SDK v17 returns a Uint8Array from hash(); Buffer.from normalizes it
       // so toString('hex') produces the 64-char hash RPC expects.
       const txHash = Buffer.from(tx.hash()).toString('hex');
-      const { rpc } = (await import('@stellar/stellar-sdk/rpc')) as unknown as {
-        rpc: {
-          Server: new (url: string) => {
-            sendTransaction(tx: unknown): Promise<{ status: string; hash?: string; errorResult?: unknown }>;
-          };
+      const { Server } = (await import('@stellar/stellar-sdk/rpc')) as unknown as {
+        Server: new (url: string) => {
+          sendTransaction(tx: unknown): Promise<{ status: string; hash?: string; errorResult?: unknown }>;
         };
       };
-      const server = new rpc.Server(env.RPC_URL);
+      const server = new Server(env.RPC_URL);
       const res = await server.sendTransaction(tx as unknown);
       if (res.status === 'ERROR') {
         throw upstream('Relayed Soroban transaction was rejected', { txHash, errorResult: res.errorResult });

@@ -64,16 +64,15 @@ vi.mock('../../src/modules/soroban/bindings/src/index.js', () => ({
 }));
 
 let getTxStatus = 'SUCCESS';
+// @stellar/stellar-sdk/rpc exports Server directly (no `rpc` namespace).
 vi.mock('@stellar/stellar-sdk/rpc', () => ({
-  rpc: {
-    Server: class {
-      async getTransaction() {
-        return { status: getTxStatus, error: 'boom' };
-      }
-      async sendTransaction() {
-        return { status: 'PENDING' };
-      }
-    },
+  Server: class {
+    async getTransaction() {
+      return { status: getTxStatus, error: 'boom' };
+    }
+    async sendTransaction() {
+      return { status: 'PENDING' };
+    }
   },
 }));
 
